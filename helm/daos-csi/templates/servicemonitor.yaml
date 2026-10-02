@@ -1,0 +1,36 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{- range $part, $port := dict "controller" .Values.controller.httpPort "node" .Values.node.httpPort }}
+{{- $name := printf "%s-%s" (include "daos-csi.fullname" $) $part }}
+---
+# headless: Prometheus scrapes every pod (the node plugin on every node)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-metrics
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" $ | nindent 4 }}
+    daos-csi/metrics: {{ $part }}
+spec:
+  clusterIP: None
+  selector: {app: {{ $name }}}
+  ports:
+  - {name: metrics, port: {{ $port }}, targetPort: {{ $port }}}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ $name }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" $ | nindent 4 }}
+    {{- with $.Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels: {daos-csi/metrics: {{ $part }}}
+  endpoints:
+  - {port: metrics, path: /metrics, interval: {{ $.Values.metrics.serviceMonitor.interval }}}
+{{- end }}
+{{- end }}

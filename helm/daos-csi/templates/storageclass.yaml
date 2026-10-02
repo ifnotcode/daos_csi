@@ -1,0 +1,23 @@
+{{- range .Values.storageClasses }}
+{{- if not (and .parameters .parameters.pool) }}
+{{- fail (printf "storageClasses: %s needs parameters.pool" .name) }}
+{{- end }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "daos-csi.labels" $ | nindent 4 }}
+  {{- if .default }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: csi.daos.io
+reclaimPolicy: {{ default "Delete" .reclaimPolicy }}
+volumeBindingMode: {{ default "Immediate" .volumeBindingMode }}
+parameters:
+  {{- range $k, $v := .parameters }}
+  {{ $k }}: {{ $v | toString | quote }}
+  {{- end }}
+{{- end }}

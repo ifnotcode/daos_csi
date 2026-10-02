@@ -1,0 +1,142 @@
+{{- $name := printf "%s-node" (include "daos-csi.fullname" .) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+---
+# The node plugin runs dfuse in mount pods (one per volume and node) in the release namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "daos-csi.fullname" . }}-mount-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "daos-csi.fullname" . }}-mount-pods
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "daos-csi.fullname" . }}-mount-pods
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {app: {{ $name }}}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+        {{- include "daos-csi.labels" . | nindent 8 }}
+      {{- include "daos-csi.metricsAnnotations" (dict "root" . "port" .Values.node.httpPort) | nindent 6 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      # host networking: the plugin reaches the API server without depending on the CNI, and in
+      # mount mode process dfuse runs here and must reach the DAOS servers without NAT
+      hostNetwork: true
+      # in mount mode process: dfuse --allow-idmap only shares its handles with interception
+      # libraries in its pid namespace or one nested in it (any pod's, if it is the host's)
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.node.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations: {{- toYaml . | nindent 6 }}
+      {{- end }}
+      containers:
+      - name: node-driver-registrar
+        image: {{ .Values.node.registrar.image }}
+        args: [--csi-address=/csi/csi.sock,
+               --kubelet-registration-path=/var/lib/kubelet/plugins/csi.daos.io/csi.sock]
+        volumeMounts:
+        - {name: plugin-dir, mountPath: /csi}
+        - {name: registration-dir, mountPath: /registration}
+      - name: daos-csi
+        image: {{ include "daos-csi.image" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+        - -node
+        - -endpoint=unix:///csi/csi.sock
+        - -mount-mode={{ .Values.node.mountMode }}
+        - -agent-dir={{ .Values.node.agentDir }}
+        - -agent-dir-in-plugin=/host{{ .Values.node.agentDir }}
+        - -dfuse-log-dir={{ .Values.node.dfuseLogDir }}
+        - -max-volumes-per-node={{ int .Values.node.maxVolumesPerNode }}
+        - -health-interval={{ .Values.node.health.interval }}
+        - -health-timeout={{ .Values.node.health.timeout }}
+        - -health-kill-after={{ .Values.node.health.killAfter }}
+        {{- with .Values.node.mountPodResources }}
+        {{- with .requests.cpu }}
+        - -mount-pod-cpu-request={{ . }}
+        {{- end }}
+        {{- with .limits.cpu }}
+        - -mount-pod-cpu-limit={{ . }}
+        {{- end }}
+        {{- with .requests.memory }}
+        - -mount-pod-memory-request={{ . }}
+        {{- end }}
+        {{- with .limits.memory }}
+        - -mount-pod-memory-limit={{ . }}
+        {{- end }}
+        {{- end }}
+        {{- include "daos-csi.httpArgs" (dict "root" . "port" .Values.node.httpPort) | nindent 8 }}
+        {{- include "daos-csi.probes" (dict "root" . "port" .Values.node.httpPort) | nindent 8 }}
+        env:
+        - name: NODE_ID
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        # mount pods run dfuse from the same image
+        - name: MOUNT_IMAGE
+          value: {{ include "daos-csi.image" . }}
+        securityContext:
+          privileged: true
+        {{- with .Values.node.resources }}
+        resources: {{- toYaml . | nindent 10 }}
+        {{- end }}
+        volumeMounts:
+        - {name: plugin-dir, mountPath: /csi}
+        - {name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional}
+        # parent of the agent directory: survives the directory being recreated on the host
+        - {name: agent-parent, mountPath: /host{{ dir .Values.node.agentDir }}, mountPropagation: HostToContainer}
+        - {name: dev-fuse, mountPath: /dev/fuse}
+        {{- if .Values.node.dfuseLogDir }}
+        - {name: logs, mountPath: {{ .Values.node.dfuseLogDir }}}
+        {{- end }}
+      volumes:
+      - {name: plugin-dir, hostPath: {path: /var/lib/kubelet/plugins/csi.daos.io, type: DirectoryOrCreate}}
+      - {name: registration-dir, hostPath: {path: /var/lib/kubelet/plugins_registry, type: Directory}}
+      - {name: kubelet-dir, hostPath: {path: /var/lib/kubelet, type: Directory}}
+      - {name: agent-parent, hostPath: {path: {{ dir .Values.node.agentDir }}, type: Directory}}
+      - {name: dev-fuse, hostPath: {path: /dev/fuse, type: CharDevice}}
+      {{- if .Values.node.dfuseLogDir }}
+      - {name: logs, hostPath: {path: {{ .Values.node.dfuseLogDir }}, type: DirectoryOrCreate}}
+      {{- end }}

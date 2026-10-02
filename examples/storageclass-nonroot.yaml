@@ -1,0 +1,40 @@
+# Volumes whose root directory belongs to uid/gid 1000 (mode 0775), for non-root pods.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: daos-uid1000
+provisioner: csi.daos.io
+parameters:
+  pool: tank
+  rootUid: "1000"
+  rootGid: "1000"
+  rootMode: "0775"
+  # pods in user namespaces reach DAOS as daos_agent's client_user_map principal (admin@ in the lab)
+  acl: "A::admin@:rwta"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: daos-uid1000
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: daos-uid1000
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-nonroot-owned
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  securityContext: {runAsUser: 1000, runAsGroup: 1000}
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c", "id; mkdir -p /data/sub && echo from-1000 > /data/sub/f.txt && ls -lan /data /data/sub; sleep 3600"]
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: daos-uid1000}}]

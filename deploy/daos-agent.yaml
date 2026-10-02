@@ -1,0 +1,76 @@
+# daos_agent as a DaemonSet, for nodes where it cannot run as a host service (e.g. Talos).
+# It serves /var/run/daos_agent/daos_agent.sock on every node for dfuse (CSI mount pods), the
+# controller's daos CLI and libpil4dfs in pods (through the CSI agent-socket inline volume).
+# Adjust the ConfigMap to your DAOS system (access points, transport security, interfaces).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: daos-agent
+  namespace: daos-csi
+data:
+  daos_agent.yml: |
+    name: daos_server
+    access_points: ['192.168.122.20']
+    port: 10001
+    transport_config:
+      allow_insecure: true
+    # interfaces that reach the DAOS servers (without this the agent may hand out CNI interfaces)
+    include_fabric_ifaces: [eth0]
+    # restarting or upgrading this pod must not evict the pool handles of running dfuse/clients
+    disable_auto_evict: true
+    credential_config:
+      client_user_map:
+        # uids without an entry in the passwd below: every pod with hostUsers: false and most
+        # non-root pods. They reach DAOS as this principal; grant it in pool/container ACLs.
+        # (The map is only consulted for unknown uids, never to rename known ones.)
+        default:
+          user: admin
+          group: admin
+  # The agent turns a client's uid into an ACL principal with the passwd/group files of ITS
+  # container, not the node's. They are replaced by these, so that the image's own users (e.g.
+  # "ubuntu" = uid 1000 in ubuntu:24.04) do not decide who a client is.
+  passwd: |
+    root:x:0:0:root:/root:/sbin/nologin
+    admin:x:1000:1000:admin:/:/sbin/nologin
+  group: |
+    root:x:0:
+    admin:x:1000:
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: daos-agent
+  namespace: daos-csi
+spec:
+  selector:
+    matchLabels: {app: daos-agent}
+  updateStrategy:
+    rollingUpdate: {maxUnavailable: 1}
+  template:
+    metadata:
+      labels: {app: daos-agent}
+    spec:
+      # the agent reports the node's fabric interfaces and must see client processes (pids from
+      # SO_PEERCRED, /proc) across the node
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: daos-agent
+        image: DAOS_CSI_IMAGE
+        imagePullPolicy: IfNotPresent
+        command: [daos_agent, -o, /etc/daos-agent/daos_agent.yml, -s, /var/run/daos_agent]
+        volumeMounts:
+        - {name: config, mountPath: /etc/daos-agent}
+        - {name: config, mountPath: /etc/passwd, subPath: passwd, readOnly: true}
+        - {name: config, mountPath: /etc/group, subPath: group, readOnly: true}
+        - {name: runtime, mountPath: /var/run/daos_agent}
+        readinessProbe:
+          exec: {command: [test, -S, /var/run/daos_agent/daos_agent.sock]}
+          periodSeconds: 10
+      volumes:
+      - {name: config, configMap: {name: daos-agent}}
+      - {name: runtime, hostPath: {path: /var/run/daos_agent, type: DirectoryOrCreate}}

@@ -1,0 +1,80 @@
+# Rough throughput comparison of the access paths (1 GiB sequential write with fsync, then read).
+# Pods run one after another (see hack/bench.sh); results are only comparable within one setup.
+#   bench-runc          runc, through dfuse (CSI volume)
+#   bench-runc-pil      runc, hostUsers: false, libpil4dfs (direct connection)
+#   bench-gvisor        gVisor, through the gofer and dfuse
+#   bench-gvisor-pil    gVisor, libpil4dfs with D_IL_*
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench
+data:
+  run.sh: |
+    f=/data/bench-$(hostname).bin
+    rm -f $f
+    run() { if [ -n "${PIL:-}" ]; then LD_PRELOAD=libpil4dfs.so D_IL_REPORT=1 "$@"; else "$@"; fi; }
+    echo "== write"; run dd if=/dev/zero of=$f bs=4M count=256 conv=fsync 2>&1 | grep -E "copied|\[write +\]"
+    echo "== read";  run dd if=$f of=/dev/null bs=4M 2>&1 | grep -E "copied|\[read +\]"
+    rm -f $f; echo DONE; sleep 3600
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: bench-runc}
+spec:
+  restartPolicy: Never
+  containers:
+  - {name: t, image: DAOS_CLIENT_IMAGE, command: [bash, /b/run.sh],
+     volumeMounts: [{name: v, mountPath: /data}, {name: b, mountPath: /b}]}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: bench}}
+  - {name: b, configMap: {name: bench}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: bench-runc-pil}
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+  - {name: t, image: DAOS_CLIENT_IMAGE, command: [bash, /b/run.sh], env: [{name: PIL, value: "1"}],
+     volumeMounts: [{name: v, mountPath: /data}, {name: b, mountPath: /b},
+                    {name: agent, mountPath: /var/run/daos_agent}]}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: bench}}
+  - {name: b, configMap: {name: bench}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: bench-gvisor}
+spec:
+  runtimeClassName: gvisor
+  restartPolicy: Never
+  containers:
+  - {name: t, image: DAOS_CLIENT_IMAGE, command: [bash, /b/run.sh],
+     volumeMounts: [{name: v, mountPath: /data}, {name: b, mountPath: /b}]}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: bench}}
+  - {name: b, configMap: {name: bench}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: bench-gvisor-pil}
+spec:
+  runtimeClassName: gvisor
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: DAOS_CLIENT_IMAGE
+    command: [bash, /b/run.sh]
+    env:
+    - {name: PIL, value: "1"}
+    - {name: D_IL_MOUNT_POINT, value: /data}
+    - {name: D_IL_POOL, value: tank}
+    - {name: D_IL_CONTAINER, value: BENCH_CONTAINER}
+    volumeMounts: [{name: v, mountPath: /data}, {name: b, mountPath: /b},
+                   {name: agent, mountPath: /var/run/daos_agent}]
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: bench}}
+  - {name: b, configMap: {name: bench}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}

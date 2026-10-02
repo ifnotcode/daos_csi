@@ -1,0 +1,13 @@
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.daos.io
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  # dfuse presents DAOS ownership as is; kubelet must not try to chown the volume
+  fsGroupPolicy: None
+  # Ephemeral: inline volumes with type=agent-socket expose daos_agent.sock to pods
+  volumeLifecycleModes: [Persistent, Ephemeral]

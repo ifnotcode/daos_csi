@@ -1,0 +1,150 @@
+{{- $name := printf "%s-controller" (include "daos-csi.fullname" .) -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "daos-csi.fullname" . }}-provisioner
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: [persistentvolumes]
+  verbs: [get, list, watch, create, delete, patch]
+- apiGroups: [""]
+  resources: [persistentvolumeclaims]
+  verbs: [get, list, watch, update]
+- apiGroups: [storage.k8s.io]
+  resources: [storageclasses, csinodes]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [list, watch, create, update, patch]
+- apiGroups: [""]
+  resources: [nodes]
+  verbs: [get, list, watch]
+- apiGroups: [storage.k8s.io]
+  resources: [volumeattachments]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "daos-csi.fullname" . }}-provisioner
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "daos-csi.fullname" . }}-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "daos-csi.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+rules:
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, watch, list, delete, update, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "daos-csi.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "daos-csi.fullname" . }}-leader-election
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  # host network: a new pod cannot start next to the old one on the same port, so stop the old
+  # one first (a rolling update with surge never finishes on a single node)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: {{ $name }}}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+        {{- include "daos-csi.labels" . | nindent 8 }}
+      {{- include "daos-csi.metricsAnnotations" (dict "root" . "port" .Values.controller.httpPort) | nindent 6 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      # The daos CLI talks to the node's daos_agent and to the DAOS servers directly; host
+      # networking avoids NAT between this pod and the servers.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.controller.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations: {{- toYaml . | nindent 6 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: csi-provisioner
+        image: {{ .Values.controller.provisioner.image }}
+        args: [--csi-address=/csi/csi.sock, --leader-election,
+               --leader-election-namespace={{ .Release.Namespace }},
+               --timeout={{ .Values.controller.provisioner.timeout }}, --extra-create-metadata]
+        volumeMounts:
+        - {name: socket-dir, mountPath: /csi}
+      - name: daos-csi
+        image: {{ include "daos-csi.image" . }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+        - -controller
+        - -endpoint=unix:///csi/csi.sock
+        {{- include "daos-csi.httpArgs" (dict "root" . "port" .Values.controller.httpPort) | nindent 8 }}
+        {{- include "daos-csi.probes" (dict "root" . "port" .Values.controller.httpPort) | nindent 8 }}
+        {{- if .Values.controller.privileged }}
+        # RDMA devices for the daos CLI
+        securityContext: {privileged: true}
+        {{- end }}
+        {{- with .Values.controller.resources }}
+        resources: {{- toYaml . | nindent 10 }}
+        {{- end }}
+        volumeMounts:
+        - {name: socket-dir, mountPath: /csi}
+        - {name: agent, mountPath: /var/run/daos_agent}
+      volumes:
+      - {name: socket-dir, emptyDir: {}}
+      - {name: agent, hostPath: {path: {{ .Values.node.agentDir }}, type: DirectoryOrCreate}}

@@ -1,0 +1,61 @@
+# libpil4dfs in a user-namespaced, non-root pod under the "restricted" Pod Security level:
+# no hostPath, no privileges. The DAOS volume and the daos_agent socket both come from the CSI
+# driver (the socket as an inline volume). The image must contain the DAOS client with the
+# patched libpil4dfs (direct connection when dfuse does not share its handles).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: daos-apps
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: daos-apps
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: daos-uid1000
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pil4dfs-restricted
+  namespace: daos-apps
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+  - name: app
+    image: DAOS_CLIENT_IMAGE
+    imagePullPolicy: IfNotPresent
+    command: ["bash", "-c"]
+    args:
+    - |
+      id; cat /proc/self/uid_map
+      pil() { LD_PRELOAD=libpil4dfs.so D_IL_REPORT=1 "$@"; }
+      pil dd if=/dev/zero of=/data/pil.bin bs=1M count=64 2>/tmp/w; grep -E "copied|\[(read|write)" /tmp/w
+      pil dd if=/data/pil.bin of=/dev/null bs=1M 2>/tmp/r; grep -E "copied|\[(read|write)" /tmp/r
+      ls -lan /data
+      echo DONE; sleep 3600
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+    volumeMounts:
+    - {name: data, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - name: data
+    persistentVolumeClaim: {claimName: data}
+  - name: agent
+    csi:
+      driver: csi.daos.io
+      volumeAttributes: {type: agent-socket}

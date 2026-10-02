@@ -1,0 +1,68 @@
+# DAOS volumes in gVisor (runsc) sandboxes. Needs a RuntimeClass "gvisor" (handler runsc) and,
+# for libpil4dfs, runsc configured with host-uds = "open" so the sandbox can connect to
+# daos_agent.sock.
+#   gv-volume          regular pod, CSI volume
+#   gv-volume-userns   the same with hostUsers: false
+#   gv-pil4dfs         libpil4dfs inside gVisor: the gofer hides the FUSE mount (it is not
+#                      fuse.daos inside the sandbox), so pil4dfs is pointed at it with D_IL_*
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gv-volume
+spec:
+  runtimeClassName: gvisor
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c", "grep /data /proc/self/mounts; echo from-gvisor > /data/gvisor.txt && cat /data/gvisor.txt && ls -lan /data | head; dd if=/dev/zero of=/data/gv.bin bs=1M count=64 2>&1 | tail -1; dd if=/data/gv.bin of=/dev/null bs=1M 2>&1 | tail -1; echo DONE; sleep 3600"]
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: daos-dyn}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gv-volume-userns
+spec:
+  runtimeClassName: gvisor
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c", "id; cat /proc/self/uid_map; grep /data /proc/self/mounts; echo from-gvisor-userns > /data/gvisor-userns.txt && ls -lan /data | head; echo DONE; sleep 3600"]
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: daos-dyn}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gv-pil4dfs
+spec:
+  runtimeClassName: gvisor
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: DAOS_CLIENT_IMAGE
+    imagePullPolicy: IfNotPresent
+    command: ["bash", "-c"]
+    args:
+    - |
+      grep -E "/data|daos_agent" /proc/self/mounts
+      pil() { LD_PRELOAD=libpil4dfs.so D_IL_REPORT=1 "$@"; }
+      echo "== auto (mount discovery)"
+      pil dd if=/dev/zero of=/data/gv-pil-auto.bin bs=1M count=64 2>&1 | grep -E "copied|ERR|\[(read|write)"
+      echo "== D_IL_MOUNT_POINT/POOL/CONTAINER"
+      export D_IL_MOUNT_POINT=/data D_IL_POOL=$POOL D_IL_CONTAINER=$CONT
+      pil dd if=/dev/zero of=/data/gv-pil-env.bin bs=1M count=64 2>&1 | grep -E "copied|ERR|\[(read|write)"
+      pil dd if=/data/gv-pil-env.bin of=/dev/null bs=1M 2>&1 | grep -E "copied|ERR|\[(read|write)"
+      echo DONE; sleep 3600
+    env:
+    - {name: POOL, value: tank}
+    - {name: CONT, value: DAOS_CONTAINER}
+    volumeMounts:
+    - {name: v, mountPath: /data}
+    - {name: agent, mountPath: /var/run/daos_agent}
+  volumes:
+  - {name: v, persistentVolumeClaim: {claimName: daos-dyn}}
+  - {name: agent, csi: {driver: csi.daos.io, volumeAttributes: {type: agent-socket}}}

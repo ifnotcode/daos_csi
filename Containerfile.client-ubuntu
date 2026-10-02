@@ -1,0 +1,20 @@
+# Base image with the DAOS client for the daos-csi image: Ubuntu with the runtime packages of the
+# client and the /opt/daos tree from a client-only build (tarball of /opt/daos, unpacked at /).
+#   docker build -f Containerfile.client-ubuntu --build-arg UBUNTU=24.04 \
+#     --build-arg CLIENT=daos-2.8.0-...-ubuntu24.04-x86_64.tar.gz -t daos-client-ubuntu:24.04 .
+# then: docker build -f Containerfile --build-arg BASE=daos-client-ubuntu:24.04 -t daos-csi:<tag> .
+# (podman build takes the same arguments.) The client tarball must be inside the build context.
+ARG UBUNTU=24.04
+FROM docker.io/library/ubuntu:${UBUNTU}
+ARG CLIENT
+# The package set that leaves no library of /opt/daos unresolved (checked with ldd in clean
+# containers); 24.04 renamed librdmacm1 to librdmacm1t64.
+RUN . /etc/os-release && \
+    case "$VERSION_ID" in 22.04) rdmacm=librdmacm1 ;; *) rdmacm="librdmacm1t64 libnl-3-200" ;; esac && \
+    apt-get update && apt-get install -y --no-install-recommends fuse3 mount libcapstone4 \
+      libhwloc15 libibverbs1 ibverbs-providers $rdmacm libnl-route-3-200 liblz4-1 libnuma1 \
+      libprotobuf-c1 libpsm2-2 && rm -rf /var/lib/apt/lists/*
+ADD ${CLIENT} /
+# LD_PRELOAD=libpil4dfs.so (or libioil.so) by name, as with the RPMs
+RUN echo /opt/daos/lib64 > /etc/ld.so.conf.d/daos.conf && ldconfig
+ENV PATH=/opt/daos/bin:$PATH

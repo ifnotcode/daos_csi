@@ -1,0 +1,24 @@
+# Static volume for an existing container: volumeHandle is "<pool>/<container>".
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: daos-posix
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  csi:
+    driver: csi.daos.io
+    volumeHandle: tank/posix
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: daos-posix
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: daos-posix
+  resources:
+    requests: {storage: 1Gi}

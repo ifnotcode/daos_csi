@@ -1,0 +1,53 @@
+# Dynamic volume (a new POSIX container in pool "tank") used by a pod in a user namespace,
+# by a regular pod, and by a non-root pod in a user namespace, all at once (RWX).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: daos-dyn
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: daos
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-userns
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c", "id; cat /proc/self/uid_map; grep /data /proc/self/mounts; echo from-userns > /data/userns.txt && ls -lan /data; sleep 3600"]
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: daos-dyn}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-hostusers
+spec:
+  restartPolicy: Never
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c", "id; echo from-hostusers > /data/hostusers.txt && ls -lan /data; sleep 3600"]
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: daos-dyn}}]
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: csi-userns-nonroot
+spec:
+  hostUsers: false
+  restartPolicy: Never
+  securityContext: {runAsUser: 1000, runAsGroup: 1000}
+  containers:
+  - name: t
+    image: docker.io/library/busybox:1.37
+    command: ["sh", "-c", "id; mkdir -p /data/u1000 2>&1; echo from-1000 > /data/nonroot.txt 2>&1; ls -lan /data; sleep 3600"]
+    volumeMounts: [{name: v, mountPath: /data}]
+  volumes: [{name: v, persistentVolumeClaim: {claimName: daos-dyn}}]

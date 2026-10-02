@@ -1,0 +1,258 @@
+# DAOS CSI driver (csi.daos.io). Needs, on every node that runs it:
+#   - daos_agent listening on /var/run/daos_agent/daos_agent.sock (host service or a DaemonSet)
+#   - Linux >= 6.12 for pods with hostUsers: false (dfuse is built with FUSE_CAP_ALLOW_IDMAP)
+# Image: set DAOS_CSI_IMAGE below (built from ../Containerfile).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: daos-csi
+  labels:
+    # privileged node plugin (FUSE mounts, mount propagation)
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/warn: privileged
+    pod-security.kubernetes.io/audit: privileged
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.daos.io
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  # dfuse presents DAOS ownership as is; kubelet must not try to chown the volume
+  fsGroupPolicy: None
+  # Ephemeral: inline volumes with type=agent-socket expose daos_agent.sock to pods
+  volumeLifecycleModes: [Persistent, Ephemeral]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: daos-csi-controller
+  namespace: daos-csi
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: daos-csi-provisioner
+rules:
+- apiGroups: [""]
+  resources: [persistentvolumes]
+  verbs: [get, list, watch, create, delete, patch]
+- apiGroups: [""]
+  resources: [persistentvolumeclaims]
+  verbs: [get, list, watch, update]
+- apiGroups: [storage.k8s.io]
+  resources: [storageclasses, csinodes]
+  verbs: [get, list, watch]
+- apiGroups: [""]
+  resources: [events]
+  verbs: [list, watch, create, update, patch]
+- apiGroups: [""]
+  resources: [nodes]
+  verbs: [get, list, watch]
+- apiGroups: [storage.k8s.io]
+  resources: [volumeattachments]
+  verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: daos-csi-provisioner
+subjects:
+- kind: ServiceAccount
+  name: daos-csi-controller
+  namespace: daos-csi
+roleRef:
+  kind: ClusterRole
+  name: daos-csi-provisioner
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: daos-csi-leader-election
+  namespace: daos-csi
+rules:
+- apiGroups: [coordination.k8s.io]
+  resources: [leases]
+  verbs: [get, watch, list, delete, update, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: daos-csi-leader-election
+  namespace: daos-csi
+subjects:
+- kind: ServiceAccount
+  name: daos-csi-controller
+  namespace: daos-csi
+roleRef:
+  kind: Role
+  name: daos-csi-leader-election
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: daos-csi-controller
+  namespace: daos-csi
+spec:
+  replicas: 1
+  # host network: a new pod cannot start next to the old one on the same port, so stop the old
+  # one first (a rolling update with surge never finishes on a single node)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: {maxSurge: 0, maxUnavailable: 1}
+  selector:
+    matchLabels: {app: daos-csi-controller}
+  template:
+    metadata:
+      labels: {app: daos-csi-controller}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "9811", prometheus.io/path: /metrics}
+    spec:
+      serviceAccountName: daos-csi-controller
+      # The daos CLI talks to the node's daos_agent and to the DAOS servers directly;
+      # host networking avoids NAT between this pod and the servers.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: csi-provisioner
+        image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+        args: [--csi-address=/csi/csi.sock, --leader-election, --leader-election-namespace=daos-csi,
+               --timeout=150s, --extra-create-metadata]
+        volumeMounts:
+        - {name: socket-dir, mountPath: /csi}
+      - name: daos-csi
+        image: DAOS_CSI_IMAGE
+        imagePullPolicy: IfNotPresent
+        # metrics and health on the host network: a port of its own, apart from the node plugin's
+        args: [-controller, -endpoint=unix:///csi/csi.sock, -http-endpoint=:9811]
+        ports: [{name: metrics, containerPort: 9811}]
+        livenessProbe:
+          httpGet: {path: /healthz, port: 9811}
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet: {path: /readyz, port: 9811}
+          periodSeconds: 5
+        volumeMounts:
+        - {name: socket-dir, mountPath: /csi}
+        - {name: agent, mountPath: /var/run/daos_agent}
+      volumes:
+      - {name: socket-dir, emptyDir: {}}
+      - {name: agent, hostPath: {path: /var/run/daos_agent, type: Directory}}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: daos-csi-node
+  namespace: daos-csi
+---
+# The node plugin runs dfuse in "mount pods" (one per volume and node) in its own namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: daos-csi-mount-pods
+  namespace: daos-csi
+rules:
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch, create, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: daos-csi-mount-pods
+  namespace: daos-csi
+subjects:
+- kind: ServiceAccount
+  name: daos-csi-node
+  namespace: daos-csi
+roleRef:
+  kind: Role
+  name: daos-csi-mount-pods
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: daos-csi-node
+  namespace: daos-csi
+spec:
+  selector:
+    matchLabels: {app: daos-csi-node}
+  template:
+    metadata:
+      labels: {app: daos-csi-node}
+      annotations: {prometheus.io/scrape: "true", prometheus.io/port: "9810", prometheus.io/path: /metrics}
+    spec:
+      serviceAccountName: daos-csi-node
+      # host networking: the plugin reaches the API server without depending on the CNI, and in
+      # mount-mode=process dfuse runs here and must reach the DAOS servers without NAT
+      hostNetwork: true
+      # in mount-mode=process: dfuse --allow-idmap only shares its handles with interception
+      # libraries in its pid namespace or one nested in it (any pod's, if it is the host's)
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: node-driver-registrar
+        image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
+        args: [--csi-address=/csi/csi.sock,
+               --kubelet-registration-path=/var/lib/kubelet/plugins/csi.daos.io/csi.sock]
+        volumeMounts:
+        - {name: plugin-dir, mountPath: /csi}
+        - {name: registration-dir, mountPath: /registration}
+      - name: daos-csi
+        image: DAOS_CSI_IMAGE
+        imagePullPolicy: IfNotPresent
+        # mount-mode=pod: dfuse runs in mount pods (same image) that survive plugin restarts.
+        # Default resources of dfuse in mount pods (volumes can override them, see README):
+        #   -mount-pod-cpu-request=100m -mount-pod-cpu-limit=2
+        #   -mount-pod-memory-request=256Mi -mount-pod-memory-limit=4Gi
+        # Volumes per node (0: no limit) and health checks of the dfuse mounts (defaults shown):
+        #   -max-volumes-per-node=0 -health-interval=60s -health-timeout=30s -health-kill-after=5m
+        args: [-node, -endpoint=unix:///csi/csi.sock, -mount-mode=pod, -http-endpoint=:9810]
+        ports: [{name: metrics, containerPort: 9810}]
+        livenessProbe:
+          httpGet: {path: /healthz, port: 9810}
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet: {path: /readyz, port: 9810}
+          periodSeconds: 5
+        env:
+        - name: NODE_ID
+          valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+        - name: MOUNT_IMAGE
+          value: DAOS_CSI_IMAGE
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - {name: plugin-dir, mountPath: /csi}
+        - {name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional}
+        # parent of the agent directory: survives the directory being recreated on the host
+        - {name: host-run, mountPath: /host/var/run, mountPropagation: HostToContainer}
+        - {name: dev-fuse, mountPath: /dev/fuse}
+        - {name: logs, mountPath: /var/log/daos-csi}
+      volumes:
+      - {name: plugin-dir, hostPath: {path: /var/lib/kubelet/plugins/csi.daos.io, type: DirectoryOrCreate}}
+      - {name: registration-dir, hostPath: {path: /var/lib/kubelet/plugins_registry, type: Directory}}
+      - {name: kubelet-dir, hostPath: {path: /var/lib/kubelet, type: Directory}}
+      - {name: host-run, hostPath: {path: /var/run, type: Directory}}
+      - {name: dev-fuse, hostPath: {path: /dev/fuse, type: CharDevice}}
+      - {name: logs, hostPath: {path: /var/log/daos-csi, type: DirectoryOrCreate}}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: daos
+provisioner: csi.daos.io
+parameters:
+  pool: tank
+  # extra dfuse arguments, e.g. "--disable-caching" for data shared between nodes
+  # dfuseArgs: ""
+reclaimPolicy: Delete
+volumeBindingMode: Immediate

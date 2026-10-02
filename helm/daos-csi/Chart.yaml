@@ -1,0 +1,7 @@
+apiVersion: v2
+name: daos-csi
+description: CSI driver for DAOS POSIX containers mounted with dfuse (csi.daos.io)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.30.0-0"

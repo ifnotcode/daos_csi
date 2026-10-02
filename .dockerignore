@@ -1,0 +1,4 @@
+# Docker and Podman both read this file. overlay/.keep only keeps the overlay/ directory, which the
+# Containerfile copies over the base image, in the build context.
+overlay/.keep
+.DS_Store

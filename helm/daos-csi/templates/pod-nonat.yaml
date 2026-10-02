@@ -1,0 +1,50 @@
+{{- if .Values.podNoNat.enabled }}
+{{- if not (and .Values.podNoNat.podCIDR .Values.podNoNat.storageCIDR) }}
+{{- fail "podNoNat.podCIDR and podNoNat.storageCIDR are required with podNoNat.enabled" }}
+{{- end }}
+# Keeps a RETURN rule for pod -> DAOS storage traffic first in nat/POSTROUTING. DAOS servers reply
+# to the address a client advertises, the pod IP; with SNAT to the node IP they cannot reach it.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "daos-csi.fullname" . }}-pod-nonat
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "daos-csi.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels: {app: {{ include "daos-csi.fullname" . }}-pod-nonat}
+  template:
+    metadata:
+      labels:
+        app: {{ include "daos-csi.fullname" . }}-pod-nonat
+        {{- include "daos-csi.labels" . | nindent 8 }}
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: nonat
+        image: {{ .Values.podNoNat.image }}
+        env:
+        - {name: POD_CIDR, value: {{ .Values.podNoNat.podCIDR | quote }}}
+        - {name: STORAGE_CIDR, value: {{ .Values.podNoNat.storageCIDR | quote }}}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          rule="-s $POD_CIDR -d $STORAGE_CIDR -m comment --comment daos-no-nat -j RETURN"
+          while true; do
+            iptables -t nat -C POSTROUTING $rule 2>/dev/null ||
+              { iptables -t nat -I POSTROUTING 1 $rule && echo "inserted: $rule"; }
+            # keep it first: CNI plugins insert their own rules at the top too
+            first=$(iptables -t nat -S POSTROUTING | { read -r _; read -r l; echo "$l"; })
+            case "$first" in *daos-no-nat*) ;; *)
+              iptables -t nat -D POSTROUTING $rule && iptables -t nat -I POSTROUTING 1 $rule &&
+                echo "moved to the top";;
+            esac
+            sleep 30
+          done
+        securityContext:
+          capabilities: {add: [NET_ADMIN, NET_RAW]}
+{{- end }}

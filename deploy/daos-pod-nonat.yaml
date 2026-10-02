@@ -1,0 +1,52 @@
+# Optional: exempt pod -> DAOS storage traffic from the CNI's masquerading.
+#
+# DAOS servers reply to the address a client advertises, i.e. the pod IP, over their own
+# connection. If the pod's traffic is SNATed to the node IP, the servers cannot reach it
+# (client: DER_TIMEDOUT; server: "NA_TIMEOUT ... from ofi+tcp://<pod ip>"). This matters for pods
+# that talk to DAOS themselves (libpil4dfs direct connections, the daos CLI, libdaos apps), not
+# for dfuse: the CSI mount pods use the host network.
+#
+# The DAOS servers must also route the pod CIDR back to the nodes (or run a routed CNI).
+# With Cilium prefer ipMasqAgent / nonMasqueradeCIDRs; with Calico an IPPool for the storage
+# network with disabled: true. This DaemonSet is the generic fallback for iptables-based CNIs
+# (flannel, bridge ipMasq, kube-proxy): it keeps a RETURN rule first in nat/POSTROUTING.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: daos-pod-nonat
+  namespace: daos-csi
+spec:
+  selector:
+    matchLabels: {app: daos-pod-nonat}
+  template:
+    metadata:
+      labels: {app: daos-pod-nonat}
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+      - operator: Exists
+      containers:
+      - name: nonat
+        # any image with iptables and its nft/legacy wrapper
+        image: registry.k8s.io/kube-proxy:v1.37.1
+        env:
+        - {name: POD_CIDR, value: "10.245.0.0/16"}
+        - {name: STORAGE_CIDR, value: "192.168.122.0/24"}
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          rule="-s $POD_CIDR -d $STORAGE_CIDR -m comment --comment daos-no-nat -j RETURN"
+          while true; do
+            iptables -t nat -C POSTROUTING $rule 2>/dev/null ||
+              { iptables -t nat -I POSTROUTING 1 $rule && echo "inserted: $rule"; }
+            # keep it first: CNI plugins insert their own rules at the top too
+            first=$(iptables -t nat -S POSTROUTING | { read -r _; read -r l; echo "$l"; })
+            case "$first" in *daos-no-nat*) ;; *)
+              iptables -t nat -D POSTROUTING $rule && iptables -t nat -I POSTROUTING 1 $rule &&
+                echo "moved to the top";;
+            esac
+            sleep 30
+          done
+        securityContext:
+          capabilities: {add: [NET_ADMIN, NET_RAW]}

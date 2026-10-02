@@ -1,0 +1,147 @@
+# Values of the daos-csi chart. The defaults deploy what deploy/daos-csi.yaml deploys: the
+# controller, the node plugin with mount pods, and the CSIDriver object. daos_agent, the no-NAT
+# DaemonSet and StorageClasses are optional (see below).
+
+# Base name of the controller, node plugin and their RBAC objects: <fullname>-controller,
+# <fullname>-node. The driver name, csi.daos.io, is fixed in the driver.
+fullnameOverride: daos-csi
+
+# Image of the driver, built from ../../Containerfile on top of an image with the DAOS client.
+# The node plugin also runs dfuse in mount pods from this image, and the agent DaemonSet uses it
+# unless agent.image is set.
+image:
+  repository: ""   # required, e.g. registry.example.com/daos-csi
+  tag: ""          # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# The release namespace must allow privileged pods: the node plugin and its mount pods (created
+# in this namespace) need FUSE mounts and mount propagation. Label it before installing:
+#   kubectl create namespace daos-csi
+#   kubectl label namespace daos-csi pod-security.kubernetes.io/enforce=privileged
+
+log:
+  level: info    # debug, info, warn or error; debug also logs every request in full
+  format: text   # text or json
+
+# Prometheus metrics (/metrics) and health endpoints (/healthz, /readyz). Both the controller and
+# the node plugin use the host network, so each needs a port free on the nodes.
+metrics:
+  enabled: true
+  podAnnotations: true     # prometheus.io/scrape, port and path on the pods
+  serviceMonitor:
+    enabled: false         # needs the Prometheus Operator CRDs
+    interval: 30s
+    labels: {}
+
+controller:
+  replicas: 1
+  httpPort: 9811
+  # The daos CLI needs RDMA devices with a verbs provider
+  privileged: false
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+    timeout: 150s
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+
+node:
+  # pod: dfuse runs in a mount pod per volume and node, and survives plugin restarts.
+  # process: dfuse runs in the plugin container; a plugin restart breaks running pods' volumes.
+  mountMode: pod
+  httpPort: 9810
+  # Host directory with daos_agent.sock
+  agentDir: /var/run/daos_agent
+  # Host directory for per-volume dfuse logs (D_LOG_FILE); empty to disable
+  dfuseLogDir: /var/log/daos-csi
+  registrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
+  # Resources of dfuse in each mount pod (one per volume and node), as defaults. A volume can
+  # override each with the StorageClass parameters dfuseCpuRequest, dfuseCpuLimit,
+  # dfuseMemoryRequest and dfuseMemoryLimit. Set at mount pod creation; running ones keep theirs.
+  # Mount pods bypass the scheduler, and kubelet rejects one whose requests do not fit the node,
+  # or evicts lower-priority pods to make room for it: keep requests small, cap with limits. A
+  # limit alone gets a request of 0 (not Kubernetes' default of request = limit).
+  # A CPU limit throttles dfuse; set --thread-count in dfuseArgs to about the limit.
+  mountPodResources:
+    requests: {cpu: "", memory: ""}
+    limits: {cpu: "", memory: ""}
+  # How many DAOS volumes the scheduler may place on a node: each is one dfuse there. 0: no limit.
+  maxVolumesPerNode: 0
+  # Health checks of the dfuse mounts: a statfs (a DAOS pool query) per volume and interval. A
+  # volume whose probe goes unanswered for longer than timeout is unhealthy
+  # (daos_csi_volume_healthy 0); after killAfter of that its dfuse is killed and restarted, and
+  # pods' mounts are switched to the new one for their next container start. interval 0 disables
+  # the checks, killAfter 0 only the kill.
+  health:
+    interval: 60s
+    timeout: 30s
+    killAfter: 5m
+  # Resources of the node plugin container itself
+  resources: {}
+  nodeSelector: {}
+  tolerations:
+  - operator: Exists
+  priorityClassName: system-node-critical
+
+# daos_agent as a DaemonSet, for nodes that do not run it as a host service (e.g. Talos). It
+# serves agentDir/daos_agent.sock on every node.
+agent:
+  enabled: false
+  name: daos-agent
+  image: {}            # repository/tag/pullPolicy; defaults to the driver image
+  # Needed with a verbs provider, for the fabric scan
+  privileged: false
+  # daos_agent.yml. Set access_points and the interfaces that reach the DAOS servers.
+  config:
+    name: daos_server
+    access_points: []
+    port: 10001
+    transport_config:
+      allow_insecure: true
+    # without it, the agent may hand out CNI interfaces
+    # include_fabric_ifaces: [eth0]
+    # restarting or upgrading the agent must not evict the pool handles of running dfuse
+    disable_auto_evict: true
+    credential_config:
+      client_user_map:
+        # uids unknown in the passwd below (pods with hostUsers: false, most non-root pods) reach
+        # DAOS as this principal; grant it in pool and container ACLs
+        default:
+          user: admin
+          group: admin
+  # The agent maps uids to ACL principals with the passwd and group of its own container. These
+  # replace the image's, so that its users (e.g. ubuntu = 1000) do not decide who a client is.
+  passwd: |
+    root:x:0:0:root:/root:/sbin/nologin
+    admin:x:1000:1000:admin:/:/sbin/nologin
+  group: |
+    root:x:0:
+    admin:x:1000:
+  resources: {}
+  nodeSelector: {}
+  tolerations:
+  - operator: Exists
+
+# Keep pod -> DAOS storage traffic out of the CNI's masquerading, for iptables-based CNIs
+# (flannel, bridge). DAOS servers reply to the pod IP, so pods that talk to DAOS themselves
+# (libpil4dfs, the daos CLI) need it; dfuse does not (host network). With Cilium or Calico, use
+# their own settings instead (see the README).
+podNoNat:
+  enabled: false
+  podCIDR: ""          # required when enabled
+  storageCIDR: ""      # required when enabled
+  image: registry.k8s.io/kube-proxy:v1.37.1   # any image with iptables
+
+# StorageClasses to create. Parameters are those of the README ("Parameters"); pool is required.
+storageClasses: []
+# - name: daos
+#   default: false
+#   reclaimPolicy: Delete
+#   volumeBindingMode: Immediate
+#   parameters:
+#     pool: tank
+#     dfuseArgs: "--allow-idmap"

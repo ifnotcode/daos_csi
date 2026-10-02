@@ -1,0 +1,1 @@
+Keeps overlay/ in the build context; .dockerignore leaves this file out of the image.

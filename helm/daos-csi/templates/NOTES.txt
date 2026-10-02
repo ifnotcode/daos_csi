@@ -1,0 +1,19 @@
+daos-csi {{ .Chart.AppVersion }} (driver csi.daos.io) is installed in {{ .Release.Namespace }}.
+
+The node plugin and its mount pods are privileged. Unless the namespace allows that already:
+  kubectl label namespace {{ .Release.Namespace }} pod-security.kubernetes.io/enforce=privileged
+{{- if not .Values.agent.enabled }}
+
+daos_agent must serve {{ .Values.node.agentDir }}/daos_agent.sock on every node (host service),
+or install with agent.enabled=true.
+{{- end }}
+{{- if not .Values.storageClasses }}
+
+No StorageClass was created: set storageClasses (pool is required), or use static PVs.
+{{- end }}
+
+Check:
+  kubectl -n {{ .Release.Namespace }} get pods
+{{- if .Values.metrics.enabled }}
+  curl http://<node>:{{ .Values.node.httpPort }}/metrics
+{{- end }}
